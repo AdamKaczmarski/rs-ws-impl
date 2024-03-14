@@ -1,6 +1,8 @@
-use std::io::{prelude::*, BufReader};
+use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
-use std::str::FromStr;
+
+use anyhow::{anyhow, Error};
+use httparse::Request;
 
 fn listen_for_connection(listener: &TcpListener) {
     for stream in listener.incoming() {
@@ -16,29 +18,57 @@ fn listen_for_connection(listener: &TcpListener) {
 }
 
 fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
-    let http_request: Vec<_> = buf_reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
-    //TODO maybe http parser to get header n stuff?
-    let request_line = http_request.first();
-    match request_line {
-        Some(req) => {
-            if let Ok(http_uri) = HttpURILine::from_str(req) {
-                route(&http_uri, stream);
+    let mut buffer = [0; 1024];
+    stream.read(&mut buffer).unwrap();
+
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(&buffer) {
+        Ok(_) => match verify_http_request(&req) {
+            Ok(_) => {
+                route(&req, stream);
             }
+            Err(err) => {
+                println!("{}", err);
+                return_error(stream)
+            }
+        },
+        Err(err) => {
+            println!("{}", err);
+            return_error(stream)
         }
-        None => return_error(stream),
     }
 }
 
-fn route(http_uri: &HttpURILine, stream: TcpStream) {
-    if http_uri.route == "/chat" && http_uri.method == "GET" && http_uri.protocol_ver >= 1.1 {
+fn verify_http_request(req: &Request<'_, '_>) -> Result<(), Error> {
+    match req.version {
+        Some(_) => {}
+        None => {
+            return Err(anyhow!("Missing HTTP Version"));
+        }
+    }
+    match req.method {
+        Some(_) => {}
+        None => {
+            return Err(anyhow!("Missing HTTP Method"));
+        }
+    }
+    match req.path {
+        Some(_) => {}
+        None => {
+            return Err(anyhow!("Missing HTTP Path"));
+        }
+    }
+    return Ok(());
+}
+
+fn route(request: &Request, stream: TcpStream) {
+    if request.path.unwrap() == "/chat"
+        && request.method.unwrap() == "GET"
+        && request.version.unwrap() >= 1
+    {
         handle_chat(stream);
     } else {
-        println!("{:?}",http_uri);
         return_error(stream);
     }
 }
@@ -68,37 +98,4 @@ fn main() {
     let listener = TcpListener::bind(addr).expect(format!("Couldn't bind port {}", addr).as_str());
     println!("Bound to address {}", addr);
     listen_for_connection(&listener);
-}
-
-#[derive(Debug, PartialEq)]
-struct HttpURILine {
-    method: String,
-    route: String,
-    protocol: String,
-    protocol_ver: f32,
-}
-#[derive(Debug, PartialEq, Eq)]
-struct ParseHttpURIError;
-
-impl FromStr for HttpURILine {
-    type Err = ParseHttpURIError;
-    //TODO error handling
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<_> = s.split(" ").map(|x| x.trim()).collect();
-        if parts.len() != 3 {
-            return Err(ParseHttpURIError);
-        }
-        let method = String::from(parts.get(0).unwrap().to_owned());
-        let route = String::from(parts.get(1).unwrap().to_owned());
-        let prot: Vec<_> = parts.get(2).unwrap().split("/").collect();
-        let protocol = String::from(prot.get(0).unwrap().to_owned());
-        let protocol_ver = prot.get(1).unwrap().parse::<f32>().unwrap();
-        let res = HttpURILine {
-            method,
-            route,
-            protocol,
-            protocol_ver,
-        };
-        return Ok(res);
-    }
 }
