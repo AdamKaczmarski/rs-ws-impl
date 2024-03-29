@@ -1,101 +1,121 @@
-use std::io::prelude::*;
-use std::net::{TcpListener, TcpStream};
+use hyper::service::service_fn;
+use std::net::SocketAddr;
 
-use anyhow::{anyhow, Error};
-use httparse::Request;
+use http_body_util::{Empty, Full};
+use hyper::{body::Bytes, server::conn::http1, Request, Response};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 
-fn listen_for_connection(listener: &TcpListener) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                handle_connection(stream);
-            }
-            Err(e) => {
-                println!("Connection failed: {}", e)
-            }
+use http_body_util::{combinators::BoxBody, BodyExt};
+use hyper::body::{Body, Frame};
+use hyper::{Method, StatusCode, Version};
+
+async fn echo(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    Ok(Response::new(req.into_body().boxed()))
+}
+
+async fn echo_reversed(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    //Set upper body buffer size
+    let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
+    if upper > 1024 * 64 {
+        let mut resp = Response::new(full("Payload too big"));
+        *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+        return Ok(resp);
+    }
+    //Read whole body stream
+    let whole_body = req.collect().await?.to_bytes();
+    let reversed_body = whole_body.iter().rev().cloned().collect::<Vec<u8>>();
+    Ok(Response::new(full(reversed_body)))
+}
+
+async fn echo_uppercase(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let frame_stream = req.into_body().map_frame(|frame| {
+        let frame = if let Ok(data) = frame.into_data() {
+            data.iter()
+                .map(|byte| byte.to_ascii_uppercase())
+                .collect::<Bytes>()
+        } else {
+            Bytes::new()
+        };
+        Frame::data(frame)
+    });
+
+    Ok(Response::new(frame_stream.boxed()))
+}
+
+async fn connect_ws(
+    _req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    todo!("Implement WS Handshake/Upgrade")
+        //TODO implement frame exchagne 
+}
+
+async fn handle_ws_connection(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    let http_version = req.version();
+    match http_version {
+        Version::HTTP_09 | Version::HTTP_10 => {
+            let mut res = Response::new(full("Older HTTP version used, please use HTTP/1.1+"));
+            *res.status_mut() = hyper::StatusCode::HTTP_VERSION_NOT_SUPPORTED;
+            Ok(res)
+        }
+        //HTTP/1.1 +
+        _ => connect_ws(req).await,
+    }
+}
+
+async fn route(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") => Ok(Response::new(full("To connect to chat send GET /chat"))),
+        (&Method::GET, "/chat") => handle_ws_connection(req).await,
+        (&Method::POST, "/echo") => echo(req).await,
+        (&Method::POST, "/echo/reversed") => echo_reversed(req).await,
+        (&Method::POST, "/echo/uppercase") => echo_uppercase(req).await,
+        _ => {
+            let mut not_found = Response::new(empty());
+            *not_found.status_mut() = StatusCode::NOT_FOUND;
+            Ok(not_found)
         }
     }
 }
-
-fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer).unwrap();
-
-    let mut headers = [httparse::EMPTY_HEADER; 16];
-    let mut req = httparse::Request::new(&mut headers);
-    match req.parse(&buffer) {
-        Ok(_) => match verify_http_request(&req) {
-            Ok(_) => {
-                route(&req, stream);
-            }
-            Err(err) => {
-                println!("{}", err);
-                return_error(stream)
-            }
-        },
-        Err(err) => {
-            println!("{}", err);
-            return_error(stream)
-        }
-    }
-}
-
-fn verify_http_request(req: &Request<'_, '_>) -> Result<(), Error> {
-    match req.version {
-        Some(_) => {}
-        None => {
-            return Err(anyhow!("Missing HTTP Version"));
-        }
-    }
-    match req.method {
-        Some(_) => {}
-        None => {
-            return Err(anyhow!("Missing HTTP Method"));
-        }
-    }
-    match req.path {
-        Some(_) => {}
-        None => {
-            return Err(anyhow!("Missing HTTP Path"));
-        }
-    }
-    return Ok(());
-}
-
-fn route(request: &Request, stream: TcpStream) {
-    if request.path.unwrap() == "/chat"
-        && request.method.unwrap() == "GET"
-        && request.version.unwrap() >= 1
-    {
-        handle_chat(stream);
-    } else {
-        return_error(stream);
-    }
-}
-
-fn handle_chat(stream: TcpStream) {
-    let response = "HTTP/1.1 200 OK\r\n\r\n".as_bytes();
-    send_response(response, stream)
-}
-
-fn return_error(stream: TcpStream) {
-    let status_line = "HTTP/1.1 400 Bad Request\r\n\r\n";
-    let contents = "Bad request";
-    let len = contents.len();
-    let response = &format!("{status_line}\r\nContent-Length: {len}\r\n\r\n{contents}");
-    let response_bytes = response.as_bytes();
-    send_response(response_bytes, stream)
-}
-
-fn send_response(response: &[u8], mut stream: TcpStream) {
-    match stream.write_all(response) {
-        Ok(_) => {}
-        Err(e) => println!("Failed to write a response! {}", e),
-    }
-}
-fn main() {
-    let addr = "127.0.0.1:8000";
-    let listener = TcpListener::bind(addr).expect(format!("Couldn't bind port {}", addr).as_str());
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8000));
+    let listener = TcpListener::bind(addr).await?;
     println!("Bound to address {}", addr);
-    listen_for_connection(&listener);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+
+        let io = TokioIo::new(stream);
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(io, service_fn(route))
+                .await
+            {
+                println!("Error serving connection: {:?}", err);
+            }
+        });
+    }
+}
+
+fn empty() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
 }
