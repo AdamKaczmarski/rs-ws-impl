@@ -5,7 +5,7 @@ use hyper::{
     body::Bytes,
     header::{
         HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
-        UPGRADE, USER_AGENT,
+        UPGRADE,
     },
     HeaderMap, Request, Response, StatusCode, Version,
 };
@@ -24,6 +24,7 @@ pub async fn connect_ws(
     let mut res = Response::new(empty());
     match ClientWebsocketUpgradeHeaders::from_headers(req.headers()) {
         Ok(client_upgrade_headers) => {
+            println!("Client upgrade headers: {:?}", client_upgrade_headers);
             //TODO I don't know how to handle websocket versions yet (I should just stick to the
             //newest)
             let serv_res_headers =
@@ -73,6 +74,7 @@ Connection: Upgrade
 Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 Sec-WebSocket-Version: 13
  */
+#[derive(Debug)]
 struct ClientWebsocketUpgradeHeaders {
     //TODO owned strings for now, think about this when ws conn works
     upgrade: String,
