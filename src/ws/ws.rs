@@ -1,3 +1,6 @@
+use bitreader::BitReader;
+use std::str::from_utf8;
+
 use anyhow::anyhow;
 use base64::prelude::*;
 use http_body_util::combinators::BoxBody;
@@ -9,23 +12,24 @@ use hyper::{
     },
     HeaderMap, Request, Response, StatusCode, Version,
 };
+use hyper_util::rt::TokioIo;
 use sha1::Digest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::utils::creators::{empty, full};
 
-//TODO server should keep track of connections, make sure to
+// TODO: server should keep track of connections, make sure to
 // add some kind of map for users connected or smth so we don't handshake the
 // same connectionmultiple times. For now implement it so our connection works.
 
 pub async fn connect_ws(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    // todo!("Implement WS Handshake/Upgrade")
     let mut res = Response::new(empty());
     match ClientWebsocketUpgradeHeaders::from_headers(req.headers()) {
         Ok(client_upgrade_headers) => {
             println!("Client upgrade headers: {:?}", client_upgrade_headers);
-            //TODO I don't know how to handle websocket versions yet (I should just stick to the
+            //TODO: I don't know how to handle websocket versions yet (I should just stick to the
             //newest)
             let serv_res_headers =
                 ServerWebsocketUpgradeHeaders::from_client_headers(&client_upgrade_headers);
@@ -50,9 +54,84 @@ pub async fn connect_ws(
     }
 
     println!("Connected client");
-    //TODO implement frame exchagne on a separate thread
+    //TODO: implement frame exchagne on a separate thread
+    tokio::task::spawn(async move {
+        match hyper::upgrade::on(&mut req).await {
+            Ok(upgraded) => {
+                if let Err(e) = upgraded_ws_conn(upgraded).await {
+                    eprint!("server error: {}", e)
+                };
+            }
+            Err(e) => eprint!("server error: {}", e),
+        }
+    });
+
     Ok(res)
 }
+
+async fn upgraded_ws_conn(upgraded: hyper::upgrade::Upgraded) -> anyhow::Result<()> {
+    println!("Upgraded connection");
+    let mut upgraded = TokioIo::new(upgraded);
+    // If masking is used, the next 4 bytes contain the masking key (see
+    let mut frame_bytes = vec![0; 4];
+    upgraded.read_exact(&mut frame_bytes).await?;
+    println!("readbytes: {:?}", frame_bytes.as_slice());
+
+    let mut reader = BitReader::new(frame_bytes.as_slice());
+    let mut i=0;
+    for _ in 0..32 {
+        i=i+1;
+        print!("{}", reader.read_u8(1)?);
+        if i % 8 == 0 {
+            println!();
+        }
+    }
+    println!();
+    let mut frame = Frame::from_bytes(frame_bytes.as_slice())?;
+    if frame.mask == 1 {
+        let mut bytes = vec![0; 4];
+        upgraded.read_exact(&mut bytes).await?;
+        frame.set_masking_key(bytes);
+    }
+    println!("{:?}", frame);
+    match frame.opcode {
+        0x0 => {
+            println!("continuation");
+        }
+        0x1 => {
+            println!("text");
+            let len: usize = frame.payload_length.try_into().unwrap();
+            println!("got len={}", len);
+            let mut payload = vec![0; len];
+            println!("payload before: {:?}", payload);
+            upgraded.read_exact(&mut payload).await?;
+            println!("paylaod after: {:?}", payload);
+            let decoded = frame.decode(payload.as_mut_slice());
+            println!("decoded_raw: {:?}", decoded);
+            let s = String::from_utf8(decoded)?;
+            println!("s: {}", s);
+        }
+        0x2 => {
+            println!("binary data");
+        }
+        _ => {
+            println!("Skipping bytes 3-F");
+        }
+    }
+    Ok(())
+}
+
+// First byte:
+// bit 0: FIN
+// bit 1: RSV1
+// bit 2: RSV2
+// bit 3: RSV3
+// bits 4-7 OPCODE
+// Bytes 2-10: payload length (see Decoding Payload Length)
+// All subsequent bytes are payload
+// async fn read_frame(){
+//
+// }
 
 pub async fn handle_ws_connection(
     req: Request<hyper::body::Incoming>,
@@ -76,7 +155,7 @@ Sec-WebSocket-Version: 13
  */
 #[derive(Debug)]
 struct ClientWebsocketUpgradeHeaders {
-    //TODO owned strings for now, think about this when ws conn works
+    //TODO: owned strings for now, think about this when ws conn works
     upgrade: String,
     connection: String,
     sec_websocket_key: String,
@@ -104,7 +183,7 @@ impl ClientWebsocketUpgradeHeaders {
         if !headers.contains_key(SEC_WEBSOCKET_VERSION) {
             return Err(anyhow!("Missing Sec-WebSocket-Version header"));
         }
-        //TODO yikes
+        //TODO: yikes
         Ok(Self {
             upgrade: headers.get(UPGRADE).unwrap().to_str().unwrap().to_owned(),
             connection: headers
@@ -135,7 +214,7 @@ Connection: Upgrade
 Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 */
 struct ServerWebsocketUpgradeHeaders {
-    //TODO owned strings for now, think about this when ws conn works
+    //TODO: owned strings for now, think about this when ws conn works
     upgrade: String,
     connection: String,
     sec_websocket_accept: String,
@@ -148,7 +227,7 @@ impl ServerWebsocketUpgradeHeaders {
     /// - Connection
     /// - Sec-WebSocket-Accept
     fn from_client_headers(client_request_headers: &ClientWebsocketUpgradeHeaders) -> Self {
-        //TODO gen the magic_str:
+        //TODO: gen the magic_str:
         let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         //add magic to Sec-WebSocket-Key
         let mut sec_websocket_accept = client_request_headers.sec_websocket_key.clone();
@@ -164,6 +243,72 @@ impl ServerWebsocketUpgradeHeaders {
             upgrade: client_request_headers.upgrade.clone(),
             connection: client_request_headers.connection.clone(),
             sec_websocket_accept,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Frame {
+    fin: u8,
+    rsv1: u8,
+    rsv2: u8,
+    rsv3: u8,
+    opcode: u8,
+    mask: u8,
+    payload_length: u64,
+    masking_key: Vec<u8>,
+}
+
+impl Frame {
+    fn from_bytes(frame_bytes: &[u8]) -> Result<Self, anyhow::Error> {
+        println!("Frame_bytes len: {}", frame_bytes.len());
+        let mut reader = BitReader::new(frame_bytes);
+        let fin = reader.read_u8(1)?;
+        let rsv1 = reader.read_u8(1)?;
+        let rsv2 = reader.read_u8(1)?;
+        let rsv3 = reader.read_u8(1)?;
+        let opcode = reader.read_u8(4)?;
+        let mask = reader.read_u8(1)?;
+        if mask != 1 {
+            return Err(anyhow!("Recevied unmasked frame"));
+        }
+        let payload_decision = reader.read_u64(7)?;
+        println!("decision: {:?}", payload_decision);
+        //TODO Basically here after decoding the length we must return the bytes
+        //to the caller so they can pull the rest of the data like masking key and payload data
+        //because payload data will be right after the masking key
+        //and if payload is <=125 then the masking key starts from
+        //bit 16 to 48
+        let payload_length = match payload_decision {
+            0..=125 => payload_decision,
+            126 => reader.read_u64(16)?,
+            127 => reader.read_u64(64)?,
+            _ => return Err(anyhow!("Couldnt parse payload length")),
+        };
+        let masking_key = Vec::new();
+        Ok(Frame {
+            fin,
+            rsv1,
+            rsv2,
+            rsv3,
+            opcode,
+            mask,
+            payload_length,
+            masking_key,
+        })
+    }
+    fn set_masking_key(&mut self, bytes: Vec<u8>) {
+        self.masking_key = bytes;
+    }
+    fn decode(&self, encoded: &mut [u8]) -> Vec<u8> {
+        if self.mask == 1 {
+            return encoded
+                .iter_mut()
+                .enumerate()
+                .map(|(idx, val)| *val ^ self.masking_key.get(idx % 4).unwrap())
+                .collect();
+        } else {
+            return Vec::from(encoded);
         }
     }
 }

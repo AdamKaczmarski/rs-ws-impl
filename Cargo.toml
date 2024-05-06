@@ -11,3 +11,4 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 sha1 = "0.10.6"
 base64 = "0.22.0"
+bitreader = "0.3.8"

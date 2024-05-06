@@ -23,6 +23,7 @@ async fn route(
         (&Method::POST, "/echo/reversed") => echo_reversed(req).await,
         (&Method::POST, "/echo/uppercase") => echo_uppercase(req).await,
         _ => {
+            println!("Unknown request {} {}", req.method(), req.uri().path());
             let mut not_found = Response::new(empty());
             *not_found.status_mut() = StatusCode::NOT_FOUND;
             Ok(not_found)
@@ -42,7 +43,7 @@ async fn main() -> Result<(), anyhow::Error> {
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(io, service_fn(route))
-                // .with_upgrades() //Hyper upgrade module
+                .with_upgrades() //Hyper upgrade module
                 .await
             {
                 println!("Error serving connection: {:?}", err);
